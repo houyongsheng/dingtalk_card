@@ -1,0 +1,6 @@
+dingtalk-stream
+python-dotenv
+loguru
+langchain-openai
+async-timeout
+httpx
