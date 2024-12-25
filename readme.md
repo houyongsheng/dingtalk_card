@@ -139,6 +139,8 @@ dingtalk_card/
 - aiohttp: 异步HTTP客户端
 - websockets: WebSocket客户端
 
+钉钉AI卡片官方文档：https://open.dingtalk.com/document/orgapp/typewriter-effect-streaming-ai-card
+
 ## 贡献指南
 
 欢迎提交Issue和Pull Request！
