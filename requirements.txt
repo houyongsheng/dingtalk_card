@@ -1,6 +1,7 @@
-dingtalk-stream
+dingtalk-stream>=0.1.0
 python-dotenv
 loguru
-langchain-openai
 async-timeout
-httpx
+websockets>=10.0
+requests
+aiohttp
