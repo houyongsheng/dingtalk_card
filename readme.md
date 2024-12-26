@@ -68,6 +68,7 @@ DINGTALK_APP_SECRET=你的钉钉应用secret
 CARD_TEMPLATE_ID=你的卡片模板ID
 API_KEY=你的Dify API密钥
 DIFY_BASE_URL=你的Dify服务器地址
+DIFY_API_ENDPOINT=你的Dify API接口类型
 ```
 
 ### 运行
@@ -119,6 +120,9 @@ pm2 restart dify-dingtalk-bot
 - `CARD_TEMPLATE_ID`: 钉钉互动卡片模板ID
 - `API_KEY`: Dify应用的API密钥
 - `DIFY_BASE_URL`: Dify服务器的基础URL，格式如 http://your-server/v1
+- `DIFY_API_ENDPOINT`: Dify API接口类型，可选值:
+  - `chat-messages`: 聊天模式
+  - `workflows/run`: 工作流模式
 
 ## 项目结构
 

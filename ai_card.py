@@ -55,12 +55,24 @@ async def call_with_stream(query: str, callback: Callable[[str], None]):
         "Accept": "text/event-stream"
     }
     
-    data = {
-        "inputs": {},
-        "query": query,
-        "user": "dify",
-        "response_mode": "streaming",
-    }
+    endpoint = os.getenv('DIFY_API_ENDPOINT', 'chat-messages')
+    
+    # 根据不同的 endpoint 使用不同的请求数据格式
+    if endpoint == 'workflows/run':
+        data = {
+            "inputs": {
+                "query": query
+            },
+            "user": "dify",
+            "response_mode": "streaming",
+        }
+    else:
+        data = {
+            "inputs": {},
+            "query": query,
+            "user": "dify",
+            "response_mode": "streaming",
+        }
     
     logger.debug(f"Making API request with headers: {headers}")
     logger.debug(f"Request data: {data}")
@@ -71,7 +83,6 @@ async def call_with_stream(query: str, callback: Callable[[str], None]):
             if not base_url:
                 raise ValueError("DIFY_BASE_URL must be set in environment variables")
                 
-            endpoint = os.getenv('DIFY_API_ENDPOINT', 'chat-messages')
             api_url = f"{base_url}/{endpoint}"
                 
             async with session.post(
@@ -113,22 +124,65 @@ async def call_with_stream(query: str, callback: Callable[[str], None]):
                                     
                                     # 处理不同类型的事件
                                     event_type = chunk_data.get("event")
+                                    
                                     if event_type == "message":
-                                        # 消息事件，包含实际的回答内容
-                                        new_content = chunk_data.get("answer", "")
-                                        if new_content:
-                                            # 累加新内容而不是替换
-                                            full_content += new_content
+                                        # 消息事件,包含实际的回答内容
+                                        answer = chunk_data.get("answer", "")
+                                        if answer:
+                                            # 累加新内容
+                                            full_content += answer
                                             await callback(full_content)
                                             logger.debug(f"Updated content: {full_content}")
+                                            
+                                    elif event_type == "text_chunk":
+                                        # 文本块事件
+                                        text = chunk_data.get("data", {}).get("text", "")
+                                        if text:
+                                            # 累加新内容
+                                            full_content += text
+                                            await callback(full_content)
+                                            logger.debug(f"Updated content from chunk: {text}")
+                                            
+                                    elif event_type == "workflow_started":
+                                        # 工作流开始
+                                        workflow_id = chunk_data.get("workflow_run_id")
+                                        logger.debug(f"Workflow started: {workflow_id}")
+                                        
+                                    elif event_type == "node_started":
+                                        # 节点开始
+                                        data = chunk_data.get("data", {})
+                                        node_id = data.get("node_id")
+                                        node_type = data.get("node_type")
+                                        title = data.get("title")
+                                        logger.debug(f"Node started - type: {node_type}, title: {title}")
+                                        
+                                    elif event_type == "node_finished":
+                                        # 节点完成
+                                        data = chunk_data.get("data", {})
+                                        node_type = data.get("node_type")
+                                        title = data.get("title")
+                                        status = data.get("status")
+                                        error = data.get("error")
+                                        if error:
+                                            logger.warning(f"Node failed - type: {node_type}, title: {title}, error: {error}")
+                                        else:
+                                            logger.debug(f"Node finished - type: {node_type}, title: {title}, status: {status}")
+                                            
+                                    elif event_type == "workflow_finished":
+                                        # 工作流完成
+                                        data = chunk_data.get("data", {})
+                                        status = data.get("status")
+                                        error = data.get("error")
+                                        if error:
+                                            logger.warning(f"Workflow failed: {error}")
+                                        else:
+                                            logger.debug(f"Workflow finished with status: {status}")
+                                            
                                     elif event_type == "error":
                                         # 错误事件
                                         error_msg = chunk_data.get("data", {}).get("message", "Unknown error")
                                         logger.error(f"Error event received: {error_msg}")
                                         raise Exception(f"Error from server: {error_msg}")
-                                    else:
-                                        # 其他工作流事件（workflow_started, node_started 等）
-                                        logger.debug(f"Workflow event received: {event_type}")
                                         
                                 except json.JSONDecodeError as e:
                                     logger.warning(f"Failed to parse chunk as JSON: {line}")
