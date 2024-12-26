@@ -71,8 +71,11 @@ async def call_with_stream(query: str, callback: Callable[[str], None]):
             if not base_url:
                 raise ValueError("DIFY_BASE_URL must be set in environment variables")
                 
+            endpoint = os.getenv('DIFY_API_ENDPOINT', 'chat-messages')
+            api_url = f"{base_url}/{endpoint}"
+                
             async with session.post(
-                f"{base_url}/chat-messages",
+                api_url,
                 headers=headers,
                 json=data
             ) as response:
