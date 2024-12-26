@@ -3,6 +3,7 @@ import logging
 import asyncio
 import argparse
 from loguru import logger
+from typing import Callable
 from dingtalk_stream import AckMessage
 import dingtalk_stream
 import requests
@@ -12,7 +13,6 @@ import urllib.parse
 import aiohttp
 import websockets
 import time
-from typing import Callable
 from dotenv import load_dotenv
 
 # 加载环境变量
@@ -198,7 +198,182 @@ async def call_with_stream(query: str, callback: Callable[[str], None]):
     return full_content
 
 
-async def handle_reply_and_update_card(self: dingtalk_stream.ChatbotHandler, incoming_message: dingtalk_stream.ChatbotMessage):
+async def download_image(download_code: str, client: dingtalk_stream.DingTalkStreamClient, robot_code: str) -> bytes:
+    """下载图片"""
+    try:
+        # 获取access token
+        access_token = client.get_access_token()
+        
+        if not access_token:
+            raise ValueError("Failed to get access token")
+            
+        # 构建下载URL
+        download_url = f"https://api.dingtalk.com/v1.0/robot/messageFiles/download"
+        headers = {
+            "x-acs-dingtalk-access-token": access_token,
+            "Content-Type": "application/json"
+        }
+        data = {
+            "downloadCode": download_code,
+            "robotCode": robot_code
+        }
+        
+        logger.info(f"下载图片, URL: {download_url}, headers: {headers}, data: {data}")
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(download_url, headers=headers, json=data) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    raise ValueError(f"Download failed with status {response.status}: {error_text}")
+                    
+                return await response.read()
+                
+    except Exception as e:
+        logger.exception("下载图片失败")
+        raise
+
+
+async def upload_to_dify(file_path: str) -> str:
+    """上传文件到dify"""
+    try:
+        api_key = os.getenv('API_KEY')
+        if not api_key:
+            raise ValueError("API_KEY not found in environment variables")
+            
+        base_url = os.getenv('DIFY_BASE_URL')
+        if not base_url:
+            raise ValueError("DIFY_BASE_URL must be set in environment variables")
+            
+        upload_url = f"{base_url}/files/upload"
+        headers = {
+            "Authorization": f"Bearer {api_key}"
+        }
+        
+        # 准备FormData
+        form = aiohttp.FormData()
+        form.add_field('type', 'image')
+        form.add_field('file',
+                      open(file_path, 'rb'),
+                      filename=os.path.basename(file_path),
+                      content_type='image/jpeg')
+        
+        logger.info(f"正在上传文件到dify: {upload_url}")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(upload_url, headers=headers, data=form) as response:
+                result = await response.json()
+                if response.status not in [200, 201]:  # 200和201都是成功状态码
+                    raise ValueError(f"Upload failed with status {response.status}: {result}")
+                    
+                logger.info(f"文件上传成功: {result}")
+                return result.get('id')
+                    
+    except Exception as e:
+        logger.exception("上传文件到dify失败")
+        raise
+
+
+async def call_dify_workflow(image_id: str, callback = None) -> str:
+    """调用dify workflow处理图片"""
+    try:
+        api_key = os.getenv('API_KEY')
+        if not api_key:
+            raise ValueError("API_KEY not found in environment variables")
+            
+        base_url = os.getenv('DIFY_BASE_URL')
+        if not base_url:
+            raise ValueError("DIFY_BASE_URL must be set in environment variables")
+            
+        workflow_url = f"{base_url}/workflows/run"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream"  # 接收SSE流
+        }
+        
+        data = {
+            "inputs": {
+                "query": "请分析这张图片的内容,告诉我这是什么"
+            },
+            "files": [{
+                "type": "image",
+                "transfer_method": "local_file",
+                "upload_file_id": image_id
+            }],
+            "response_mode": "streaming",  # 使用streaming模式
+            "user": "dingtalk"
+        }
+        
+        logger.info(f"调用workflow处理图片: {workflow_url}, data: {data}")
+        result_text = ""
+        async with aiohttp.ClientSession() as session:
+            async with session.post(workflow_url, headers=headers, json=data) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    raise ValueError(f"Workflow failed with status {response.status}: {error_text}")
+                
+                # 处理SSE流
+                async for line in response.content:
+                    if line:
+                        line = line.decode('utf-8').strip()
+                        if line.startswith('data: '):
+                            try:
+                                event_data = json.loads(line[6:])  # 去掉'data: '前缀
+                                logger.info(f"收到事件: {event_data}")
+                                
+                                # 处理text_chunk事件
+                                if event_data.get('event') == 'text_chunk':
+                                    chunk_text = event_data.get('data', {}).get('text', '')
+                                    if chunk_text:
+                                        result_text += chunk_text
+                                        # 如果有callback,实时更新卡片
+                                        if callback:
+                                            await callback(result_text)
+                                elif event_data.get('event') == 'error':
+                                    raise ValueError(f"Workflow error: {event_data.get('message')}")
+                                    
+                            except json.JSONDecodeError:
+                                logger.warning(f"无法解析事件数据: {line}")
+                                
+        if not result_text:
+            result_text = "处理完成,但没有返回结果"
+            
+        return result_text
+                
+    except Exception as e:
+        logger.exception("调用workflow失败")
+        raise
+
+
+async def process_image(image_data: bytes, callback: Callable[[str], None] = None) -> str:
+    """处理图片并返回结果"""
+    try:
+        # 保存图片到临时文件
+        temp_path = "temp_image.jpg"
+        with open(temp_path, "wb") as f:
+            f.write(image_data)
+            
+        logger.info(f"图片已保存到: {temp_path}")
+        
+        try:
+            # 上传到dify
+            image_id = await upload_to_dify(temp_path)
+            
+            # 调用workflow处理
+            result = await call_dify_workflow(image_id, callback)
+            
+        finally:
+            # 清理临时文件
+            os.remove(temp_path)
+            logger.info("临时文件已清理")
+        
+        return result
+        
+    except Exception as e:
+        logger.exception("处理图片失败")
+        raise
+
+
+async def handle_reply_and_update_card(self: dingtalk_stream.ChatbotHandler, incoming_message: dingtalk_stream.ChatbotMessage, callback_data: dict = None):
     """处理回复并更新卡片"""
     # 卡片模板 ID
     card_template_id = os.getenv("CARD_TEMPLATE_ID")  # 从环境变量获取模板ID
@@ -209,58 +384,114 @@ async def handle_reply_and_update_card(self: dingtalk_stream.ChatbotHandler, inc
         card_instance = dingtalk_stream.AICardReplier(
             self.dingtalk_client, incoming_message
         )
-        # 先投放卡片: https://open.dingtalk.com/document/orgapp/create-and-deliver-cards
+        # 先投放卡片
         card_instance_id = await card_instance.async_create_and_deliver_card(
             card_template_id, card_data
         )
 
-        # 再流式更新卡片: https://open.dingtalk.com/document/isvapp/api-streamingupdate
-        async def callback(content_value: str):
-            return await card_instance.async_streaming(
-                card_instance_id,
-                content_key=content_key,
-                content_value=content_value,
-                append=False,
-                finished=False,
-                failed=False,
-            )
+        if incoming_message.message_type in ["picture", "richText"]:
+            try:
+                # 获取图片信息
+                if not callback_data:
+                    raise ValueError("缺少callback_data")
+                    
+                robot_code = callback_data.get("robotCode")
+                if not robot_code:
+                    raise ValueError("未找到robotCode")
+                    
+                # 处理不同类型的消息内容
+                if incoming_message.message_type == "picture":
+                    content = callback_data.get("content", {})
+                    download_code = content.get("downloadCode")
+                    picture_download_code = content.get("pictureDownloadCode")
+                else:  # richText
+                    rich_text = callback_data.get("content", {}).get("richText", [])
+                    # 找到第一个picture类型的元素
+                    picture_item = next((item for item in rich_text if item.get("type") == "picture"), None)
+                    if not picture_item:
+                        raise ValueError("未在richText中找到图片")
+                    download_code = picture_item.get("downloadCode")
+                    picture_download_code = picture_item.get("pictureDownloadCode")
+                    
+                logger.info(f"图片消息内容: {content if incoming_message.message_type == 'picture' else picture_item}")
+                
+                if not download_code and not picture_download_code:
+                    raise ValueError("未找到图片下载码")
+                    
+                # 下载图片
+                image_data = await download_image(download_code, self.dingtalk_client, robot_code)
+                
+                # 定义回调函数用于实时更新卡片
+                async def update_card(content: str):
+                    await card_instance.async_streaming(
+                        card_instance_id,
+                        content_key=content_key,
+                        content_value=content,
+                        append=False,
+                        finished=False,
+                        failed=False
+                    )
+                
+                # 处理图片
+                result = await process_image(image_data, update_card)
+                
+                # 更新卡片显示最终结果
+                await card_instance.async_streaming(
+                    card_instance_id,
+                    content_key=content_key,
+                    content_value=result,
+                    append=False,
+                    finished=True,
+                    failed=False,
+                )
+                
+            except Exception as e:
+                logger.exception(f"处理图片消息失败: {str(e)}")
+                await card_instance.async_streaming(
+                    card_instance_id,
+                    content_key=content_key,
+                    content_value=f"处理图片失败: {str(e)}",
+                    append=False,
+                    finished=False,
+                    failed=True,
+                )
+        else:  # 处理文本消息
+            async def callback(content_value: str):
+                return await card_instance.async_streaming(
+                    card_instance_id,
+                    content_key=content_key,
+                    content_value=content_value,
+                    append=False,
+                    finished=False,
+                    failed=False,
+                )
 
-        try:
-            full_content_value = await call_with_stream(
-                incoming_message.text.content, callback
-            )
-            # 设置完成状态
-            await card_instance.async_streaming(
-                card_instance_id,
-                content_key=content_key,
-                content_value=full_content_value,
-                append=False,
-                finished=True,
-                failed=False,
-            )
-        except Exception as e:
-            logger.exception(e)
-            # 设置失败状态
-            await card_instance.async_streaming(
-                card_instance_id,
-                content_key=content_key,
-                content_value=f"处理失败: {str(e)}",
-                append=False,
-                finished=False,
-                failed=True,
-            )
+            try:
+                full_content_value = await call_with_stream(
+                    incoming_message.text.content, callback
+                )
+                # 设置完成状态
+                await card_instance.async_streaming(
+                    card_instance_id,
+                    content_key=content_key,
+                    content_value=full_content_value,
+                    append=False,
+                    finished=True,
+                    failed=False,
+                )
+            except Exception as e:
+                logger.exception(e)
+                # 设置失败状态
+                await card_instance.async_streaming(
+                    card_instance_id,
+                    content_key=content_key,
+                    content_value=f"处理失败: {str(e)}",
+                    append=False,
+                    finished=False,
+                    failed=True,
+                )
     except Exception as e:
         logger.exception(f"处理消息失败: {str(e)}")
-
-
-def setup_logger():
-    logger = logging.getLogger()
-    handler = logging.StreamHandler()
-    handler.setFormatter(
-        logging.Formatter('%(asctime)s %(name)-8s %(levelname)-8s %(message)s [%(filename)s:%(lineno)d]'))
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    return logger
 
 
 class CardBotHandler(dingtalk_stream.ChatbotHandler):
@@ -274,12 +505,12 @@ class CardBotHandler(dingtalk_stream.ChatbotHandler):
         incoming_message = dingtalk_stream.ChatbotMessage.from_dict(callback.data)
         self.logger.info(f"收到消息：{incoming_message}")
 
-        if incoming_message.message_type != "text":
-            self.reply_text("俺只看得懂文字喔~", incoming_message)
+        if incoming_message.message_type not in ["text", "picture", "richText"]:
+            self.reply_text("俺只看得懂文字和图片喔~", incoming_message)
             return AckMessage.STATUS_OK, "OK"
 
         # 创建异步任务处理消息
-        asyncio.create_task(handle_reply_and_update_card(self, incoming_message))
+        asyncio.create_task(handle_reply_and_update_card(self, incoming_message, callback.data))
         return AckMessage.STATUS_OK, "OK"
 
 
@@ -320,6 +551,16 @@ class DebugDingTalkStreamClient(dingtalk_stream.DingTalkStreamClient):
                 self.logger.error(f'WebSocket connection failed: {str(e)}')
                 time.sleep(3)
                 continue
+
+
+def setup_logger():
+    logger = logging.getLogger()
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter('%(asctime)s %(name)-8s %(levelname)-8s %(message)s [%(filename)s:%(lineno)d]'))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    return logger
 
 
 def main():
